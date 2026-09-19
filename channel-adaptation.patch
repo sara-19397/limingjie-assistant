@@ -12,15 +12,17 @@ index d9ea9e7..8854fde 100644
  - 登录、刷开局和数据库更新需要网络；画面自动化需要通知、屏幕捕获和无障碍服务权限。不需要悬浮窗权限。
  
 diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
-index d4766a4..e160dcb 100644
+index d4766a4..3305af5 100644
 --- a/android/app/build.gradle.kts
 +++ b/android/app/build.gradle.kts
-@@ -14,7 +14,7 @@ android {
+@@ -13,8 +13,8 @@ android {
+         applicationId = "com.landosol.toolbox"
          minSdk = 26
          targetSdk = 35
-         versionCode = 1
+-        versionCode = 1
 -        versionName = "0.1.0-dev"
-+        versionName = "0.1.0-channels-dev"
++        versionCode = 2
++        versionName = "0.1.1-channels-capture-fix"
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
      }
@@ -322,6 +324,30 @@ index 74bad61..2f67815 100644
 -        const val GAME_PACKAGE_NAME = "com.bilibili.priconne"
 -    }
  }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/automation/capture/MediaProjectionCaptureService.kt b/android/app/src/main/java/com/landosol/toolbox/automation/capture/MediaProjectionCaptureService.kt
+index cbfd6f6..7c2a401 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/automation/capture/MediaProjectionCaptureService.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/automation/capture/MediaProjectionCaptureService.kt
+@@ -369,15 +369,11 @@ class MediaProjectionCaptureService : Service() {
+         private const val NOTIFICATION_ID = 4101
+         private const val FRAME_INTERVAL_MILLIS = 100L
+         private const val INITIAL_DISPLAY_SAMPLE_INTERVAL_MILLIS = 100L
+-        // 公共镜像显示器会进入 Accessibility 的有效显示器集合；否则 MuMu 将游戏输入
+-        // 克隆到捕获显示器后，无障碍只能把手势发往不可触达游戏的默认显示器。
++        // Capture is a private mirror, never an external display that the game can render into.
++        // PUBLIC exposes this output to other apps and can move their windows off the real screen.
++        // Accessibility gestures continue to target Display.DEFAULT_DISPLAY.
+         private fun captureDisplayFlags(): Int =
+-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
+-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+-                } else {
+-                    0
+-                }
++            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
+ 
+         fun start(context: Context, resultCode: Int, data: Intent) {
+             val intent = Intent(context, MediaProjectionCaptureService::class.java)
 diff --git a/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt b/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt
 index 96615a6..cf9ef24 100644
 --- a/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt
@@ -738,6 +764,35 @@ index ebdf4b3..821d81c 100644
 +        SdkSession(uid, accessKey, updatedAt, server)
      }
  }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/ui/LandosolToolboxApp.kt b/android/app/src/main/java/com/landosol/toolbox/ui/LandosolToolboxApp.kt
+index f0cca1a..d866877 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/ui/LandosolToolboxApp.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/ui/LandosolToolboxApp.kt
+@@ -29,6 +29,8 @@ import android.content.Intent
+ import android.os.PowerManager
+ import android.provider.Settings
+ import android.media.projection.MediaProjectionManager
++import android.media.projection.MediaProjectionConfig
++import android.os.Build
+ import android.view.WindowManager
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.platform.LocalContext
+@@ -105,7 +107,14 @@ fun LandosolToolboxApp() {
+         } else {
+             pendingCaptureAction = action
+             val manager = context.getSystemService(MediaProjectionManager::class.java)
+-            projectionLauncher.launch(manager.createScreenCaptureIntent())
++            // The entry flow switches between the toolbox and game; app-only sharing would
++            // keep capturing the selected app instead of the foreground game.
++            val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
++                manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
++            } else {
++                manager.createScreenCaptureIntent()
++            }
++            projectionLauncher.launch(captureIntent)
+         }
+     }
+     val taskNotificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
 diff --git a/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt b/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt
 index d9e185b..6adf9d7 100644
 --- a/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt
