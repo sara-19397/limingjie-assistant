@@ -1,0 +1,885 @@
+diff --git a/README.md b/README.md
+index d9ea9e7..8854fde 100644
+--- a/README.md
++++ b/README.md
+@@ -50,7 +50,7 @@
+ 
+ - 工程最低系统要求为 Android 8.0（API 26），不代表已验证所有符合版本要求的设备。
+ - 已测试环境仅为 **MuMu 模拟器，1920 × 1080**。手机、其他模拟器、其他分辨率及宽高比均暂未验证。
+-- 当前适配游戏包名：`com.bilibili.priconne`。
++- 此分支新增具体渠道客户端选择与手动会话 token 入口，详见 [渠道适配说明](android/docs/channel-adaptation.md)。渠道 SDK 原生登录尚未实现，所有渠道流程均未实测。
+ - 视觉资源以横屏 `1920 × 1080` 为主要参考尺寸，识别时进行坐标映射；其他分辨率、宽高比、遮挡和窗口裁切需要实际验证。
+ - 登录、刷开局和数据库更新需要网络；画面自动化需要通知、屏幕捕获和无障碍服务权限。不需要悬浮窗权限。
+ 
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index d4766a4..e160dcb 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -14,7 +14,7 @@ android {
+         minSdk = 26
+         targetSdk = 35
+         versionCode = 1
+-        versionName = "0.1.0-dev"
++        versionName = "0.1.0-channels-dev"
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+     }
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 004d649..3ab6841 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -10,6 +10,14 @@
+ 
+     <queries>
+         <package android:name="com.bilibili.priconne" />
++        <package android:name="com.bilibili.priconne.mi" />
++        <package android:name="com.bilibili.priconne.huawei" />
++        <package android:name="com.bilibili.priconne.vivo" />
++        <package android:name="com.tencent.tmgp.bilibili.priconne" />
++        <package android:name="com.bilibili.priconne.aligames" />
++        <package android:name="com.bilibili.priconne.nearme.gamecenter" />
++        <package android:name="com.bilibili.priconne.m4399" />
++        <package android:name="com.bilibili.priconne.yofun.mumu" />
+     </queries>
+ 
+     <application
+diff --git a/android/app/src/main/java/com/landosol/toolbox/LandosolToolboxApplication.kt b/android/app/src/main/java/com/landosol/toolbox/LandosolToolboxApplication.kt
+index 114d6f6..83962d5 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/LandosolToolboxApplication.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/LandosolToolboxApplication.kt
+@@ -49,6 +49,7 @@ import com.landosol.toolbox.protocol.bilibili.BilibiliGameGatewayFactory
+ import com.landosol.toolbox.protocol.bilibili.BilibiliNativeLoginCoordinator
+ import com.landosol.toolbox.protocol.bilibili.BilibiliSdkGatewayFactory
+ import com.landosol.toolbox.protocol.bilibili.InMemoryGameSessionRegistry
++import com.landosol.toolbox.protocol.bilibili.AndroidGameClientLocator
+ import com.landosol.toolbox.security.AndroidKeystoreCredentialStore
+ import com.landosol.toolbox.security.AndroidKeystoreSdkSessionStore
+ import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionSession
+@@ -91,7 +92,10 @@ class LandosolToolboxApplication : Application() {
+     val automationOverlayCoordinator by lazy {
+         AutomationOverlayCoordinator(AndroidAutomationNotificationHost(this))
+     }
+-    private val accessibilityActionBackend by lazy { AndroidAccessibilityActionBackend() }
++    private val gameClientLocator by lazy { AndroidGameClientLocator(this) }
++    private val accessibilityActionBackend by lazy {
++        AndroidAccessibilityActionBackend(gameClientLocator::isActiveGamePackage)
++    }
+     val automationActionExecutor by lazy {
+         SessionBoundActionExecutor(automationSessionManager, accessibilityActionBackend)
+     }
+@@ -177,7 +181,7 @@ class LandosolToolboxApplication : Application() {
+             actionExecutor = automationActionExecutor,
+             actionsAvailable = LandosolAccessibilityService::isConnected,
+             actionTargetReady = {
+-                LandosolAccessibilityService.foregroundPackage() == GAME_PACKAGE_NAME
++                gameClientLocator.isActiveGamePackage(LandosolAccessibilityService.foregroundPackage())
+             },
+             actionPlannerFactory = {
+                 LabyrinthEntryActionPlanner(
+@@ -213,8 +217,8 @@ class LandosolToolboxApplication : Application() {
+                     )
+                 }
+             },
+-            gameLauncher = gameLauncher@{
+-                val intent = packageManager.getLaunchIntentForPackage(GAME_PACKAGE_NAME)
++            gameLauncher = gameLauncher@{ accountId ->
++                val intent = gameClientLocator.launchIntent(accountRepository.resolveServer(accountId))
+                     ?: return@gameLauncher false
+                 runCatching {
+                     startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+@@ -271,7 +275,7 @@ class LandosolToolboxApplication : Application() {
+     val gameSessionResetWorkflow by lazy {
+         val frameTracker = SessionExpiryFrameTracker()
+         val presence = AccessibilityForegroundPresenceObserver(
+-            gamePackageName = GAME_PACKAGE_NAME,
++            isGamePackage = gameClientLocator::isActiveGamePackage,
+             foregroundPackage = LandosolAccessibilityService::foregroundPackage,
+         )
+         // After a server-side reroll the client still holds the previous run's local state.
+@@ -300,7 +304,8 @@ class LandosolToolboxApplication : Application() {
+             backend = CompositeSessionResetBackend(
+                 terminator = terminator,
+                 relauncher = Relauncher {
+-                    val intent = packageManager.getLaunchIntentForPackage(GAME_PACKAGE_NAME)
++                    val intent = gameClientLocator.relaunchIntent()
++                        ?: gameClientLocator.launchIntent(accountRepository.resolveServer(null))
+                         ?: return@Relauncher GameClientRelaunchResult.LAUNCH_UNAVAILABLE
+                     runCatching {
+                         startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+@@ -481,6 +486,8 @@ class LandosolToolboxApplication : Application() {
+             .format(java.util.Date())
+         autoRunJob?.cancel()
+         autoRunJob = autoRunScope.launch {
++            // Bind the channel before the first batch reset (which precedes startRun).
++            gameClientLocator.launchIntent(accountRepository.resolveServer(id)) ?: return@launch
+             labyrinthBatchController.start(
+                 batchId = batchId,
+                 accountId = id,
+@@ -510,7 +517,6 @@ class LandosolToolboxApplication : Application() {
+             com.landosol.toolbox.labyrinth.batch.LabyrinthBatchStage.RECORDING_RESULT,
+         )
+         const val DATABASE_UPDATE_LOG_TAG = "LabyrinthCnDatabase"
+-        const val GAME_PACKAGE_NAME = "com.bilibili.priconne"
+         /** 旧触发点「冒险→黎明界」。已弃用：刷开局后会进入无识别的公会选择页。 */
+         @Suppress("unused")
+         val SESSION_EXPIRY_TRIGGER_POINT = ScreenPoint(1735f, 805f)
+diff --git a/android/app/src/main/java/com/landosol/toolbox/account/AccountModels.kt b/android/app/src/main/java/com/landosol/toolbox/account/AccountModels.kt
+index b1d09d4..dbd1883 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/account/AccountModels.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/account/AccountModels.kt
+@@ -1,10 +1,13 @@
+ package com.landosol.toolbox.account
+ 
++import com.landosol.toolbox.protocol.bilibili.GameServer
++
+ data class NormalizedAccountInput(
+     val alias: String,
+     val loginId: String,
+     val password: String,
+     val gameUid: String?,
++    val server: GameServer = GameServer.CN_BILIBILI,
+ )
+ 
+ sealed interface AccountValidationResult {
+@@ -19,6 +22,7 @@ object AccountInputValidator {
+         password: String,
+         gameUid: String,
+         passwordRequired: Boolean,
++        server: GameServer = GameServer.CN_BILIBILI,
+     ): AccountValidationResult {
+         val normalizedAlias = alias.trim()
+         val normalizedLoginId = loginId.trim()
+@@ -31,8 +35,9 @@ object AccountInputValidator {
+             normalizedLoginId.isEmpty() -> AccountValidationResult.Invalid("请输入登录账号")
+             normalizedLoginId.length > 128 -> AccountValidationResult.Invalid("登录账号不能超过 128 个字符")
+             normalizedLoginId.any(Char::isISOControl) -> AccountValidationResult.Invalid("登录账号包含不可用字符")
+-            passwordRequired && password.isEmpty() -> AccountValidationResult.Invalid("请输入密码")
+-            password.length > 512 -> AccountValidationResult.Invalid("密码长度超出限制")
++            passwordRequired && password.isBlank() -> AccountValidationResult.Invalid(if (server.isChannel) "请输入渠道会话 token" else "请输入密码")
++            password.length > (if (server.isChannel) 8192 else 512) -> AccountValidationResult.Invalid("登录凭据长度超出限制")
++            server.isChannel && password.any(Char::isISOControl) -> AccountValidationResult.Invalid("token 包含换行或控制字符，请只填写 token 值")
+             normalizedUid != null && normalizedUid.length > 64 -> AccountValidationResult.Invalid("游戏 UID 不能超过 64 个字符")
+             normalizedUid?.any(Char::isISOControl) == true -> AccountValidationResult.Invalid("游戏 UID 包含不可用字符")
+             else -> AccountValidationResult.Valid(
+@@ -41,6 +46,7 @@ object AccountInputValidator {
+                     loginId = normalizedLoginId,
+                     password = password,
+                     gameUid = normalizedUid,
++                    server = server,
+                 ),
+             )
+         }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/account/AccountRepository.kt b/android/app/src/main/java/com/landosol/toolbox/account/AccountRepository.kt
+index 830e082..5b1d0eb 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/account/AccountRepository.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/account/AccountRepository.kt
+@@ -6,6 +6,7 @@ import com.landosol.toolbox.data.local.AppDatabase
+ import com.landosol.toolbox.security.AccountCredentials
+ import com.landosol.toolbox.security.CredentialStore
+ import com.landosol.toolbox.protocol.bilibili.AccountLoginMaterial
++import com.landosol.toolbox.protocol.bilibili.GameServer
+ import com.landosol.toolbox.protocol.bilibili.SdkSessionStore
+ import com.landosol.toolbox.protocol.bilibili.GameSessionRegistry
+ import java.util.UUID
+@@ -25,6 +26,7 @@ data class AccountEditorData(
+     val alias: String,
+     val loginId: String,
+     val gameUid: String,
++    val server: GameServer,
+ )
+ 
+ class AccountRepository(
+@@ -46,6 +48,11 @@ class AccountRepository(
+         }
+     }
+ 
++    suspend fun resolveServer(id: Long?): GameServer {
++        val account = if (id != null) database.accountDao().getById(id) else database.accountDao().getSelected()
++        return account?.let { GameServer.fromStorageId(it.serverId) } ?: GameServer.CN_BILIBILI
++    }
++
+     suspend fun loadEditor(id: Long): AccountEditorData {
+         val account = requireNotNull(database.accountDao().getById(id)) { "账号不存在" }
+         val credentials = requireNotNull(credentialStore.read(account.credentialKey)) { "账号凭据不可用" }
+@@ -54,6 +61,7 @@ class AccountRepository(
+             alias = account.alias,
+             loginId = credentials.loginId,
+             gameUid = account.gameUid.orEmpty(),
++            server = GameServer.fromStorageId(account.serverId),
+         )
+     }
+ 
+@@ -65,6 +73,7 @@ class AccountRepository(
+             credentialKey = account.credentialKey,
+             loginId = credentials.loginId,
+             password = credentials.password,
++            server = GameServer.fromStorageId(account.serverId),
+         )
+     }
+ 
+@@ -77,7 +86,7 @@ class AccountRepository(
+                 database.accountDao().insert(
+                     AccountEntity(
+                         alias = input.alias,
+-                        serverId = SERVER_CN_BILIBILI,
++                        serverId = input.server.storageId,
+                         gameUid = input.gameUid,
+                         credentialKey = credentialKey,
+                         isSelected = database.accountDao().count() == 0,
+@@ -94,6 +103,7 @@ class AccountRepository(
+ 
+     suspend fun update(id: Long, input: NormalizedAccountInput) {
+         val account = requireNotNull(database.accountDao().getById(id)) { "账号不存在" }
++        require(input.server.storageId == account.serverId) { "暂不支持直接修改账号服务器，请新建账号" }
+         val previous = requireNotNull(credentialStore.read(account.credentialKey)) { "账号凭据不可用" }
+         val replacement = AccountCredentials(
+             loginId = input.loginId,
+@@ -152,12 +162,6 @@ class AccountRepository(
+         }
+     }
+ 
+-    private fun serverDisplayName(serverId: String): String = when (serverId) {
+-        SERVER_CN_BILIBILI -> "国服 Bilibili"
+-        else -> serverId
+-    }
+-
+-    private companion object {
+-        const val SERVER_CN_BILIBILI = "cn-bilibili"
+-    }
++    private fun serverDisplayName(serverId: String): String =
++        GameServer.entries.firstOrNull { it.storageId == serverId }?.displayName ?: serverId
+ }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/account/AccountViewModel.kt b/android/app/src/main/java/com/landosol/toolbox/account/AccountViewModel.kt
+index 55963b3..41a7f80 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/account/AccountViewModel.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/account/AccountViewModel.kt
+@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.viewModelScope
+ import com.landosol.toolbox.protocol.bilibili.CaptchaChallenge
++import com.landosol.toolbox.protocol.bilibili.GameServer
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.combine
+@@ -17,8 +18,12 @@ data class AccountEditorState(
+     val loginId: String = "",
+     val password: String = "",
+     val gameUid: String = "",
++    val server: GameServer = GameServer.CN_BILIBILI,
+ ) {
+     val isEditing: Boolean get() = id != null
++
++    fun selectServer(server: GameServer): AccountEditorState =
++        if (isEditing) this else copy(server = server)
+ }
+ 
+ data class AccountUiState(
+@@ -77,6 +82,7 @@ class AccountViewModel(
+                         loginId = value.loginId,
+                         password = "",
+                         gameUid = value.gameUid,
++                        server = value.server,
+                     ),
+                 )
+             }
+@@ -100,6 +106,7 @@ class AccountViewModel(
+                 password = editor.password,
+                 gameUid = editor.gameUid,
+                 passwordRequired = !editor.isEditing,
++                server = editor.server,
+             )
+         ) {
+             is AccountValidationResult.Invalid -> chrome.update { it.copy(message = validation.message) }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/automation/accessibility/LandosolAccessibilityService.kt b/android/app/src/main/java/com/landosol/toolbox/automation/accessibility/LandosolAccessibilityService.kt
+index 74bad61..2f67815 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/automation/accessibility/LandosolAccessibilityService.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/automation/accessibility/LandosolAccessibilityService.kt
+@@ -252,14 +252,16 @@ class LandosolAccessibilityService : AccessibilityService() {
+ }
+ 
+ class AndroidAccessibilityActionBackend(
+-    private val expectedPackageName: String? = GAME_PACKAGE_NAME,
++    private val expectedPackage: ((String?) -> Boolean)? = { packageName ->
++        com.landosol.toolbox.protocol.bilibili.PcrGamePackages.classify(packageName) != null
++    },
+ ) : AutomationActionBackend {
+     override suspend fun execute(action: AutomationAction): AutomationBackendResult {
+         if (!action.hasValidCoordinates()) return AutomationBackendResult.Rejected("动作坐标无效")
+         val service = LandosolAccessibilityService.current()
+             ?: return AutomationBackendResult.Rejected("无障碍服务未连接")
+         val foregroundPackage = LandosolAccessibilityService.foregroundPackage()
+-        if (expectedPackageName != null && foregroundPackage != expectedPackageName) {
++        if (expectedPackage != null && !expectedPackage.invoke(foregroundPackage)) {
+             return AutomationBackendResult.Rejected(GAME_NOT_FOREGROUND_REASON)
+         }
+         return service.perform(
+@@ -273,8 +275,4 @@ class AndroidAccessibilityActionBackend(
+         is AutomationAction.Swipe -> start.x >= 0f && start.y >= 0f && end.x >= 0f && end.y >= 0f
+         AutomationAction.Back -> true
+     }
+-
+-    private companion object {
+-        const val GAME_PACKAGE_NAME = "com.bilibili.priconne"
+-    }
+ }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt b/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt
+index 96615a6..cf9ef24 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/automation/session/GameSessionResetContracts.kt
+@@ -65,11 +65,16 @@ interface GameClientPresenceObserver {
+ 
+ /** 由无障碍服务的前台包名观察实现的无 Root 在场检测 */
+ class AccessibilityForegroundPresenceObserver(
+-    private val gamePackageName: String,
+     private val foregroundPackage: () -> String?,
++    private val isGamePackage: (String?) -> Boolean,
+ ) : GameClientPresenceObserver {
+     override suspend fun isGameForeground(): Boolean =
+-        foregroundPackage() == gamePackageName
++        isGamePackage(foregroundPackage())
++
++    constructor(
++        gamePackageName: String,
++        foregroundPackage: () -> String?,
++    ) : this(foregroundPackage, { packageName -> packageName == gamePackageName })
+ }
+ 
+ /** 测试用在场观察者 */
+diff --git a/android/app/src/main/java/com/landosol/toolbox/labyrinth/LabyrinthEntryRecognitionSession.kt b/android/app/src/main/java/com/landosol/toolbox/labyrinth/LabyrinthEntryRecognitionSession.kt
+index 151643d..3fa7c00 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/labyrinth/LabyrinthEntryRecognitionSession.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/labyrinth/LabyrinthEntryRecognitionSession.kt
+@@ -808,7 +808,7 @@ class LabyrinthEntryRecognitionSession(
+     private val actionExecutor: SessionBoundActionExecutor? = null,
+     private val actionsAvailable: () -> Boolean = { actionExecutor != null },
+     private val actionTargetReady: () -> Boolean = { true },
+-    private val gameLauncher: () -> Boolean = { true },
++    private val gameLauncher: suspend (Long?) -> Boolean = { true },
+     private val actionPlannerFactory: () -> LabyrinthEntryActionPlanner = { LabyrinthEntryActionPlanner() },
+     private var relicChoicePolicy: LabyrinthRelicChoicePolicy = LabyrinthRelicChoicePolicy(),
+     private var shopPolicy: LabyrinthShopPolicy = LabyrinthShopPolicy(relicChoicePolicy),
+@@ -1343,7 +1343,7 @@ class LabyrinthEntryRecognitionSession(
+             return LabyrinthEntryRecognitionStartResult.Blocked(reason)
+         }
+         armFirstFrameWatchdog(session.id)
+-        if (!dryRun && !gameLauncher()) {
++        if (!dryRun && !gameLauncher(accountId)) {
+             firstFrameWatchdog?.cancel()
+             firstFrameWatchdog = null
+             lease?.let(CaptureFrameBus::unregister)
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameClientLocator.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameClientLocator.kt
+new file mode 100644
+index 0000000..6f8519e
+--- /dev/null
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameClientLocator.kt
+@@ -0,0 +1,55 @@
++package com.landosol.toolbox.protocol.bilibili
++
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.os.Build
++
++data class InstalledGameClient(val packageName: String, val server: GameServer)
++
++/** Exact client identifiers observed in the local LDPlayer application catalogue. */
++object PcrGamePackages {
++    const val BILIBILI = "com.bilibili.priconne"
++    val knownPackages: Map<String, GameServer> = linkedMapOf(
++        BILIBILI to GameServer.CN_BILIBILI,
++        "com.bilibili.priconne.huawei" to GameServer.CN_HUAWEI,
++        "com.bilibili.priconne.vivo" to GameServer.CN_VIVO,
++        "com.bilibili.priconne.nearme.gamecenter" to GameServer.CN_OPPO,
++        "com.bilibili.priconne.mi" to GameServer.CN_XIAOMI,
++        "com.bilibili.priconne.aligames" to GameServer.CN_ALIGAMES,
++        "com.bilibili.priconne.m4399" to GameServer.CN_4399,
++        "com.tencent.tmgp.bilibili.priconne" to GameServer.CN_TENCENT,
++        "com.bilibili.priconne.yofun.mumu" to GameServer.CN_MUMU,
++    )
++    fun classify(packageName: String?): GameServer? = knownPackages[packageName]
++}
++
++class AndroidGameClientLocator(context: Context) {
++    private val packageManager = context.applicationContext.packageManager
++    @Volatile private var activePackage: String? = null
++    fun isSupportedGamePackage(packageName: String?): Boolean = PcrGamePackages.classify(packageName) != null
++    fun isActiveGamePackage(packageName: String?): Boolean = packageName != null && packageName == activePackage
++    fun findInstalled(server: GameServer): InstalledGameClient? = installedClients().filter {
++        it.server == server || (server == GameServer.CN_CHANNEL && it.server.isChannel)
++    }.singleOrNull()
++    fun launchIntent(server: GameServer): Intent? {
++        activePackage = null
++        val client = findInstalled(server) ?: return null
++        val intent = packageManager.getLaunchIntentForPackage(client.packageName) ?: return null
++        activePackage = client.packageName
++        return intent
++    }
++    /** Reset must return to the same client even if the selected account has changed. */
++    fun relaunchIntent(): Intent? = activePackage?.let(packageManager::getLaunchIntentForPackage)
++    fun installedClients(): List<InstalledGameClient> = PcrGamePackages.knownPackages.mapNotNull { (name, server) ->
++        if (isInstalled(name)) InstalledGameClient(name, server) else null
++    }
++    private fun isInstalled(name: String): Boolean = runCatching {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            packageManager.getPackageInfo(name, PackageManager.PackageInfoFlags.of(0))
++        } else {
++            @Suppress("DEPRECATION")
++            packageManager.getPackageInfo(name, 0)
++        }
++    }.isSuccess
++}
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameProtocolProfileFactory.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameProtocolProfileFactory.kt
+index c788416..801ab7a 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameProtocolProfileFactory.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/AndroidGameProtocolProfileFactory.kt
+@@ -10,9 +10,12 @@ data class GameProtocolProfile(
+ 
+ class AndroidGameProtocolProfileFactory(
+     private val context: Context,
++    private val gameClientLocator: AndroidGameClientLocator = AndroidGameClientLocator(context),
+ ) {
+-    fun create(): GameProtocolProfile {
+-        val packageInfo = context.packageManager.getPackageInfo(GAME_PACKAGE, 0)
++    fun create(server: GameServer = GameServer.CN_BILIBILI): GameProtocolProfile {
++        val client = gameClientLocator.findInstalled(server)
++            ?: error("未找到唯一的${server.displayName}客户端；请安装客户端，并在账号设置选择具体渠道")
++        val packageInfo = context.packageManager.getPackageInfo(client.packageName, 0)
+         val appVersion = packageInfo.versionName.orEmpty().ifBlank { error("无法读取国服游戏版本") }
+         val model = listOf(Build.BRAND, Build.MODEL).filter { it.isNotBlank() }.joinToString(" ")
+         return GameProtocolProfile(
+@@ -44,7 +47,6 @@ class AndroidGameProtocolProfileFactory(
+     }
+ 
+     private companion object {
+-        const val GAME_PACKAGE = "com.bilibili.priconne"
+         const val UNITY_VERSION = "2021.3.20f1c1"
+         const val RES_KEY = "ab00a0a6dd915a052a2ef7fd649083e5"
+         const val DEFAULT_RES_VERSION = "10002200"
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameGatewayFactory.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameGatewayFactory.kt
+index bef1cf4..64524f9 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameGatewayFactory.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameGatewayFactory.kt
+@@ -8,6 +8,7 @@ import okhttp3.OkHttpClient
+ 
+ object BilibiliGameGatewayFactory {
+     fun create(context: Context): BilibiliGameGateway {
++        val gameClientLocator = AndroidGameClientLocator(context.applicationContext)
+         val client = OkHttpClient.Builder()
+             .connectTimeout(20, TimeUnit.SECONDS)
+             .readTimeout(30, TimeUnit.SECONDS)
+@@ -18,10 +19,15 @@ object BilibiliGameGatewayFactory {
+         return BilibiliGameProtocolGateway(
+             client = client,
+             bootstrapEndpoint = BOOTSTRAP_ENDPOINT.toHttpUrl(),
+-            profile = AndroidGameProtocolProfileFactory(context.applicationContext).create(),
++            channelBootstrapEndpoint = CHANNEL_BOOTSTRAP_ENDPOINT.toHttpUrl(),
++            profileProvider = AndroidGameProtocolProfileFactory(
++                context.applicationContext,
++                gameClientLocator,
++            )::create,
+             json = Json { ignoreUnknownKeys = true },
+         )
+     }
+ 
+     private const val BOOTSTRAP_ENDPOINT = "https://l3-prod-all-gs-gzlj.bilibiligame.net/"
++    private const val CHANNEL_BOOTSTRAP_ENDPOINT = "https://l1-prod-uo-gs-gzlj.bilibiligame.net/"
+ }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameProtocolGateway.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameProtocolGateway.kt
+index 38fc9d6..c2ea6ba 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameProtocolGateway.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliGameProtocolGateway.kt
+@@ -24,7 +24,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
+ class BilibiliGameProtocolGateway(
+     private val client: OkHttpClient,
+     private val bootstrapEndpoint: HttpUrl,
+-    private val profile: GameProtocolProfile,
++    private val channelBootstrapEndpoint: HttpUrl = bootstrapEndpoint,
++    private val profile: GameProtocolProfile? = null,
++    private val profileProvider: ((GameServer) -> GameProtocolProfile)? = null,
+     private val codec: MessagePackCodec = MessagePackCodec(),
+     private val crypto: GameProtocolCrypto = GameProtocolCrypto(),
+     private val json: Json = Json { ignoreUnknownKeys = true },
+@@ -35,11 +37,18 @@ class BilibiliGameProtocolGateway(
+         deviceSeed: String,
+         captcha: CaptchaSolution?,
+     ): GameLoginResult = withContext(Dispatchers.IO) {
+-        val state = ClientState(
+-            server = bootstrapEndpoint,
+-            headers = profile.headers.toMutableMap().apply { put("DEVICE-ID", md5Hex(deviceSeed)) },
+-        )
+         try {
++            val server = sdkSession.server
++            val activeProfile = profileProvider?.invoke(server)
++                ?: requireNotNull(profile) { "游戏协议配置不可用" }
++            val state = ClientState(
++                server = if (server.isChannel) channelBootstrapEndpoint else bootstrapEndpoint,
++                headers = activeProfile.headers.toMutableMap().apply {
++                    put("DEVICE-ID", md5Hex(deviceSeed))
++                    put("PLATFORM-ID", server.protocolPlatform)
++                    if (server.isChannel) put("RES-KEY", CHANNEL_RES_KEY)
++                },
++            )
+             discoverServer(state)
+             loadMaintenance(state)
+             val login = encryptedRequest(
+@@ -49,7 +58,7 @@ class BilibiliGameProtocolGateway(
+                 fields = linkedMapOf(
+                     "uid" to sdkSession.uid,
+                     "access_key" to sdkSession.accessKey,
+-                    "platform" to "2",
++                    "platform" to server.protocolPlatform,
+                     "channel_id" to "1",
+                     "challenge" to captcha?.challenge,
+                     "validate" to captcha?.validate,
+@@ -85,7 +94,7 @@ class BilibiliGameProtocolGateway(
+             val viewerId = user.long("viewer_id") ?: state.viewerId.takeIf { it > 0 } ?: error("游戏 UID 缺失")
+             val userName = user.string("user_name").orEmpty().ifBlank { "未命名玩家" }
+             val teamLevel = user.long("team_level")?.toInt() ?: 0
+-            val accountProfile = GameAccountProfile(viewerId, userName, teamLevel, profile.appVersion)
++            val accountProfile = GameAccountProfile(viewerId, userName, teamLevel, activeProfile.appVersion)
+             GameLoginResult.Success(accountProfile, ProtocolSession(state, accountProfile))
+         } catch (failure: GameApiFailure) {
+             val message = failure.message.orEmpty().ifBlank { "游戏服拒绝请求" }.take(MAX_MESSAGE_LENGTH)
+@@ -123,6 +132,9 @@ class BilibiliGameProtocolGateway(
+         envelope.data.string("required_manifest_ver")?.takeIf(String::isNotBlank)?.let {
+             state.headers["MANIFEST-VER"] = it
+         }
++        envelope.data.string("res_key")?.takeIf(String::isNotBlank)?.let {
++            state.headers["RES-KEY"] = it
++        }
+         envelope.data.string("res_ver")?.takeIf(String::isNotBlank)?.let {
+             state.headers["RES-VER"] = it
+         }
+@@ -257,6 +269,7 @@ class BilibiliGameProtocolGateway(
+         val BINARY_MEDIA_TYPE = "application/octet-stream".toMediaType()
+         const val MAX_MESSAGE_LENGTH = 200
+         const val MAX_NETWORK_DETAIL_LENGTH = 80
++        const val CHANNEL_RES_KEY = "d145b29050641dac2f8b19df0afe0e59"
+     }
+ }
+ 
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliNativeLoginCoordinator.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliNativeLoginCoordinator.kt
+index 87e2a1d..72d4355 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliNativeLoginCoordinator.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliNativeLoginCoordinator.kt
+@@ -16,6 +16,14 @@ class BilibiliNativeLoginCoordinator(
+     suspend fun start(material: AccountLoginMaterial): NativeLoginResult = mutex.withLock {
+         pending.remove(material.accountId)
+         sdkCoordinator.cancel(material.accountId)
++        if (material.server.isChannel) {
++            val directSession = SdkSession(
++                uid = material.loginId,
++                accessKey = material.password,
++                server = material.server,
++            )
++            return@withLock loginGame(material, directSession)
++        }
+         val cached = sessionStore.read(material.credentialKey)
+         if (cached != null) {
+             when (val result = gameGateway.loginAndLoadProfile(cached, material.loginId)) {
+@@ -119,7 +127,13 @@ class BilibiliNativeLoginCoordinator(
+     private suspend fun requestGameCaptcha(
+         material: AccountLoginMaterial,
+         session: SdkSession,
+-    ): NativeLoginResult = when (val captcha = sdkGateway.startCaptcha()) {
++    ): NativeLoginResult = if (material.server.isChannel) {
++        failure(
++            LoginFailureKind.Rejected,
++            "渠道服登录触发游戏风控；请先在渠道客户端重新登录，再重新提取 login_id/token 后重试",
++            material,
++        )
++    } else when (val captcha = sdkGateway.startCaptcha()) {
+         is SdkCaptchaResult.Ready -> {
+             pending[material.accountId] = PendingCaptcha.GameRisk(material, session, captcha.challenge)
+             NativeLoginResult.CaptchaRequired(captcha.challenge)
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkContracts.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkContracts.kt
+index 9df722f..bbbffc1 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkContracts.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkContracts.kt
+@@ -7,6 +7,31 @@ class SdkLoginCredentials(
+     override fun toString(): String = "SdkLoginCredentials(REDACTED)"
+ }
+ 
++enum class GameServer(
++    val storageId: String,
++    val displayName: String,
++    val protocolPlatform: String,
++) {
++    CN_BILIBILI("cn-bilibili", "国服 Bilibili", "2"),
++    CN_CHANNEL("cn-channel", "国服渠道服", "4"),
++    CN_HUAWEI("cn-huawei", "华为渠道服", "4"),
++    CN_VIVO("cn-vivo", "vivo 渠道服", "4"),
++    CN_OPPO("cn-oppo", "OPPO 渠道服", "4"),
++    CN_XIAOMI("cn-xiaomi", "小米渠道服", "4"),
++    CN_ALIGAMES("cn-aligames", "九游渠道服", "4"),
++    CN_4399("cn-4399", "4399 渠道服", "4"),
++    CN_TENCENT("cn-tencent", "应用宝渠道服", "4"),
++    CN_MUMU("cn-mumu", "MuMu 渠道服", "4"),
++    ;
++
++    val isChannel: Boolean get() = this != CN_BILIBILI
++
++    companion object {
++        fun fromStorageId(value: String): GameServer = entries.firstOrNull { it.storageId == value }
++            ?: CN_BILIBILI
++    }
++}
++
+ data class CaptchaChallenge(
+     val gt: String,
+     val challenge: String,
+@@ -26,13 +51,19 @@ class SdkSession(
+     val uid: String,
+     val accessKey: String,
+     val updatedAt: Long = 0L,
++    val server: GameServer = GameServer.CN_BILIBILI,
+ ) {
+     override fun equals(other: Any?): Boolean =
+-        other is SdkSession && uid == other.uid && accessKey == other.accessKey && updatedAt == other.updatedAt
++        other is SdkSession &&
++            uid == other.uid &&
++            accessKey == other.accessKey &&
++            updatedAt == other.updatedAt &&
++            server == other.server
+ 
+-    override fun hashCode(): Int = 31 * (31 * uid.hashCode() + accessKey.hashCode()) + updatedAt.hashCode()
++    override fun hashCode(): Int = 31 * (31 * (31 * uid.hashCode() + accessKey.hashCode()) + updatedAt.hashCode()) + server.hashCode()
+ 
+-    override fun toString(): String = "SdkSession(uid=REDACTED, accessKey=REDACTED, updatedAt=$updatedAt)"
++    override fun toString(): String =
++        "SdkSession(uid=REDACTED, accessKey=REDACTED, updatedAt=$updatedAt, server=${server.storageId})"
+ }
+ 
+ sealed interface SdkLoginResult {
+@@ -70,8 +101,10 @@ class AccountLoginMaterial(
+     val credentialKey: String,
+     val loginId: String,
+     val password: String,
++    val server: GameServer = GameServer.CN_BILIBILI,
+ ) {
+-    override fun toString(): String = "AccountLoginMaterial(accountId=$accountId, REDACTED)"
++    override fun toString(): String =
++        "AccountLoginMaterial(accountId=$accountId, server=${server.storageId}, REDACTED)"
+ }
+ 
+ enum class LoginFailureKind {
+diff --git a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkGatewayFactory.kt b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkGatewayFactory.kt
+index f6c6d85..536c971 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkGatewayFactory.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/protocol/bilibili/BilibiliSdkGatewayFactory.kt
+@@ -7,7 +7,25 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.OkHttpClient
+ 
+ object BilibiliSdkGatewayFactory {
+-    fun create(context: Context): BilibiliSdkGateway {
++    fun create(context: Context): BilibiliSdkGateway = object : BilibiliSdkGateway {
++        private val delegate by lazy { createDelegate(context.applicationContext) }
++
++        override suspend fun login(credentials: SdkLoginCredentials, captcha: CaptchaSolution?): SdkLoginResult {
++            val gateway = try { delegate } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
++                return SdkLoginResult.ProtocolFailure("未安装 Bilibili 官服客户端；渠道服请在账号设置选择对应渠道")
++            }
++            return gateway.login(credentials, captcha)
++        }
++
++        override suspend fun startCaptcha(): SdkCaptchaResult {
++            val gateway = try { delegate } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
++                return SdkCaptchaResult.ProtocolFailure("未安装 Bilibili 官服客户端")
++            }
++            return gateway.startCaptcha()
++        }
++    }
++
++    private fun createDelegate(context: Context): BilibiliSdkGateway {
+         val client = OkHttpClient.Builder()
+             .connectTimeout(20, TimeUnit.SECONDS)
+             .readTimeout(30, TimeUnit.SECONDS)
+diff --git a/android/app/src/main/java/com/landosol/toolbox/security/SdkSessionStores.kt b/android/app/src/main/java/com/landosol/toolbox/security/SdkSessionStores.kt
+index ebdf4b3..821d81c 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/security/SdkSessionStores.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/security/SdkSessionStores.kt
+@@ -1,6 +1,7 @@
+ package com.landosol.toolbox.security
+ 
+ import android.content.Context
++import com.landosol.toolbox.protocol.bilibili.GameServer
+ import com.landosol.toolbox.protocol.bilibili.SdkSession
+ import com.landosol.toolbox.protocol.bilibili.SdkSessionStore
+ import java.io.ByteArrayInputStream
+@@ -12,11 +13,11 @@ class InMemorySdkSessionStore : SdkSessionStore {
+     private val sessions = mutableMapOf<String, SdkSession>()
+ 
+     override suspend fun save(key: String, session: SdkSession) {
+-        sessions[key] = SdkSession(session.uid, session.accessKey, session.updatedAt)
++        sessions[key] = SdkSession(session.uid, session.accessKey, session.updatedAt, session.server)
+     }
+ 
+     override suspend fun read(key: String): SdkSession? = sessions[key]?.let {
+-        SdkSession(it.uid, it.accessKey, it.updatedAt)
++        SdkSession(it.uid, it.accessKey, it.updatedAt, it.server)
+     }
+ 
+     override suspend fun delete(key: String) {
+@@ -45,11 +46,16 @@ class AndroidKeystoreSdkSessionStore(
+             output.writeUTF(session.uid)
+             output.writeUTF(session.accessKey)
+             output.writeLong(session.updatedAt)
++            output.writeUTF(session.server.storageId)
+         }
+         buffer.toByteArray()
+     }
+ 
+     private fun decode(bytes: ByteArray): SdkSession = DataInputStream(ByteArrayInputStream(bytes)).use { input ->
+-        SdkSession(input.readUTF(), input.readUTF(), input.readLong())
++        val uid = input.readUTF()
++        val accessKey = input.readUTF()
++        val updatedAt = input.readLong()
++        val server = if (input.available() > 0) GameServer.fromStorageId(input.readUTF()) else GameServer.CN_BILIBILI
++        SdkSession(uid, accessKey, updatedAt, server)
+     }
+ }
+diff --git a/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt b/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt
+index d9e185b..6adf9d7 100644
+--- a/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt
++++ b/android/app/src/main/java/com/landosol/toolbox/ui/account/AccountScreen.kt
+@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.rememberScrollState
+@@ -18,6 +19,7 @@ import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.RadioButton
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+@@ -30,6 +32,7 @@ import androidx.compose.ui.unit.dp
+ import com.landosol.toolbox.account.AccountEditorState
+ import com.landosol.toolbox.account.AccountListItem
+ import com.landosol.toolbox.account.AccountUiState
++import com.landosol.toolbox.protocol.bilibili.GameServer
+ 
+ @Composable
+ @OptIn(ExperimentalMaterial3Api::class)
+@@ -67,7 +70,7 @@ fun AccountScreen(
+         ) {
+             item {
+                 Text(
+-                    text = "账号与密码使用 Android Keystore 加密，不写入 Room。选择当前账号后，黎明界功能会在需要时自动登录。",
++                    text = "密码和渠道会话 token 使用 Android Keystore 加密，不写入 Room。请为账号选择正确的客户端渠道。",
+                     style = MaterialTheme.typography.bodySmall,
+                 )
+             }
+@@ -194,13 +197,35 @@ private fun AccountEditorDialog(
+                 modifier = Modifier.verticalScroll(rememberScrollState()),
+                 verticalArrangement = Arrangement.spacedBy(10.dp),
+             ) {
+-                OutlinedTextField(
+-                    value = "国服 Bilibili",
+-                    onValueChange = {},
+-                    readOnly = true,
+-                    label = { Text("服务器") },
+-                    modifier = Modifier.fillMaxWidth(),
+-                )
++                Text("服务器", style = MaterialTheme.typography.labelMedium)
++                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
++                    GameServer.entries.filter { it != GameServer.CN_CHANNEL || editor.server == it }.forEach { server ->
++                        Row(
++                            modifier = Modifier
++                                .fillMaxWidth()
++                                .clickable(enabled = !editor.isEditing) {
++                                    onChange { it.selectServer(server) }
++                                }
++                                .padding(vertical = 4.dp),
++                            verticalAlignment = Alignment.CenterVertically,
++                        ) {
++                            RadioButton(
++                                selected = editor.server == server,
++                                onClick = if (editor.isEditing) null else {
++                                    { onChange { it.selectServer(server) } }
++                                },
++                                enabled = !editor.isEditing,
++                            )
++                            Text(server.displayName)
++                        }
++                    }
++                }
++                if (editor.server.isChannel) {
++                    Text(
++                        "渠道会话登录（未实测）：填写本人渠道会话的 login_id 与 token，不是游戏 UID 或渠道账号密码。当前不提供渠道 SDK 登录及 token 自动获取；过期后需更新。",
++                        style = MaterialTheme.typography.bodySmall,
++                    )
++                }
+                 OutlinedTextField(
+                     value = editor.alias,
+                     onValueChange = { value -> onChange { it.copy(alias = value) } },
+@@ -211,14 +236,25 @@ private fun AccountEditorDialog(
+                 OutlinedTextField(
+                     value = editor.loginId,
+                     onValueChange = { value -> onChange { it.copy(loginId = value) } },
+-                    label = { Text("登录账号") },
++                    label = {
++                        Text(if (editor.server.isChannel) "login_id / uid" else "登录账号")
++                    },
+                     singleLine = true,
+                     modifier = Modifier.fillMaxWidth(),
+                 )
+                 OutlinedTextField(
+                     value = editor.password,
+                     onValueChange = { value -> onChange { it.copy(password = value) } },
+-                    label = { Text(if (editor.isEditing) "新密码（留空则不修改）" else "密码") },
++                    label = {
++                        Text(
++                            when {
++                                editor.server.isChannel && editor.isEditing -> "新 token（留空则不修改）"
++                                editor.server.isChannel -> "token / access_key"
++                                editor.isEditing -> "新密码（留空则不修改）"
++                                else -> "密码"
++                            },
++                        )
++                    },
+                     singleLine = true,
+                     visualTransformation = PasswordVisualTransformation(),
+                     modifier = Modifier.fillMaxWidth(),
+diff --git a/android/docs/channel-adaptation.md b/android/docs/channel-adaptation.md
+new file mode 100644
+index 0000000..195b7e2
+--- /dev/null
++++ b/android/docs/channel-adaptation.md
+@@ -0,0 +1,31 @@
++# 渠道客户端适配（未实测）
++
++本分支基于 wbero/limingjie-assistant 的 55084d0，复用其已撤回渠道实验中的会话协议结构并修正客户端选择与 SDK 初始化。
++
++## 当前实现
++
++账号分别保存华为、vivo、OPPO、小米、九游、4399、应用宝、MuMu 渠道标识；启动、游戏版本读取和自动化目标按具体渠道匹配。会话重置返回同一个客户端。未知包名不会因为包含 priconne 字样就被当作操作目标；旧 cn-channel 账号只有在唯一渠道客户端可用时才自动选择。
++
++渠道登录入口接受用户自行提供的有效 login_id/token，沿用上游实验的渠道引导地址与平台 4 协议。它不提供华为/vivo 等渠道 SDK 的账号密码、短信、扫码登录，也不自动读取客户端凭据。渠道 token 不能填渠道密码或游戏 viewer_id，过期需在账号编辑中更新。凭据继续由 Android Keystore 加密保存。
++
++## 本机发现的客户端
++
++| 渠道 | 包名 | 证据 |
++| --- | --- | --- |
++| Bilibili | com.bilibili.priconne | 雷电共享应用图标目录 |
++| 华为 | com.bilibili.priconne.huawei | ADB 包信息，11.7.2 / 354 |
++| vivo | com.bilibili.priconne.vivo | ADB 包信息，11.7.2 / 354 |
++| OPPO | com.bilibili.priconne.nearme.gamecenter | 雷电共享应用图标目录 |
++| 小米 | com.bilibili.priconne.mi | 雷电共享应用图标目录 |
++| 九游 | com.bilibili.priconne.aligames | 雷电共享应用图标目录 |
++| 4399 | com.bilibili.priconne.m4399 | 雷电共享应用图标目录 |
++| 应用宝 | com.tencent.tmgp.bilibili.priconne | 雷电共享应用图标目录 |
++| MuMu | com.bilibili.priconne.yofun.mumu | 雷电共享应用图标目录 |
++
++图标缓存只能证明本机记录过该包名，不能证明该实例当前可运行或协议兼容。华为、vivo 启动入口都为 com.bilibili.priconne.bili.SplashActivity；实现通过 PackageManager 获取入口，不硬编码 Activity。
++
++## 构建与边界
++
++根据用户要求不运行测试、不安装 APK、不执行游戏操作；CI 仅执行 `:app:assembleDebug`。输出为开发签名 Debug APK。
++
++各渠道的真实网络登录、刷开局和图像流程均未验证。通用渠道协议来自上游实验，不能据此声称所有渠道完整兼容；各渠道 SDK 原生登录仍未实现。识别资源继续复用国服 1920×1080 模板与已有坐标映射，未声称新增分辨率实测覆盖。
